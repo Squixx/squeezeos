@@ -2,14 +2,14 @@ DESCRIPTION = "SqueezePlay"
 LICENSE = "Logitech Public Source License"
 
 PV = "${DISTRO_VERSION}+svnr${SRCREV}"
-PR = "r26"
+PR = "r27"
 
 DEPENDS += "libsdl libsdl-ttf libsdl-gfx libsdl-image"
 DEPENDS += "lua lua-native luatolua++"
 DEPENDS += "flac libmad tremor fdk-aac"
 
 RDEPENDS += "liblua5.1-socket liblua5.1-json liblua5.1-zipfilter liblua5.1-loop liblua5.1-filesystem liblua5.1-profiler liblua5.1-tolua++ liblua5.1-md5 liblua5.1-expat"
-RDEPENDS += "freefont"
+RDEPENDS += "dejavu-fonts-ttf"
 
 SRC_URI = "${SQUEEZEPLAY_SCM};module=squeezeplay \
 	file://logconf.lua"
