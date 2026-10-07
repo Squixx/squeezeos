@@ -51,12 +51,24 @@ case "$1" in
 		echo " Squeezelite"
 		/bin/kill $(cat $PIDFILE)
 
-		while [ -e $PIDFILE ]; do
-			echo "waiting for stop to complete"
-			sleep 1
+		WAIT=1
+		while true; do
+			if [ "$WAIT" -gt "3" ]; then
+				/bin/kill -TERM $(/bin/ps axw | grep -F "$PIDFILE" | grep -v grep | awk '{printf "%d", $1}')
+				/bin/rm "$PIDFILE"
+				echo " killed"
+				break
+			fi
+			if [ -e $PIDFILE ]; then
+				echo "waiting for stop to complete"
+				sleep 1
+			else
+				break
+			fi
+			WAIT=$(expr ${WAIT} + 1)
 		done
 	else
-		echo ""
+		echo " failed"
 	fi
 	;;
 
