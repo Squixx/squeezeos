@@ -1,0 +1,280 @@
+#!/bin/sh
+#
+# wifi-watchdog - detect a dead wireless link on the Squeezebox Radio and
+# recover it without a reboot.
+#
+# The Atheros AR6xxx driver/firmware can stop passing traffic while
+# wpa_supplicant still reports the link as COMPLETED, or stop associating
+# altogether. SqueezePlay only shows this (stuck red or blue wifi icon) and
+# has no way of resetting the chip, so the link stays down until a reboot.
+#
+# Every CHECK_INTERVAL seconds the watchdog checks that the radio is
+# associated, has a DHCP lease and a default gateway, and that the gateway
+# actually answers (ARP, falling back to ICMP). On consecutive failures it
+# escalates:
+#   1. soft: reassociate, renew the DHCP lease, restart udhcpc/wpa_cli if dead
+#   2. hard: reload the wifi driver and firmware (/etc/init.d/wlan stop/start)
+#            and reconfigure IP, backing off while the link stays down
+#   3. reboot, only if the driver itself can no longer be unloaded/loaded
+#
+# Settings in /etc/wlan.conf:
+#   watchdog=off          disable the watchdog
+#   watchdog_reboot=off   never reboot, even if the driver can not be reloaded
+#
+# Usage: wifi-watchdog        start in the background (no-op if running)
+#        wifi-watchdog stop   stop the background watchdog
+
+IFACE=eth1
+PIDFILE=/var/run/wifi-watchdog.pid
+UDHCPC_PIDFILE=/var/run/udhcpc.$IFACE.pid
+REBOOT_COUNT_FILE=/etc/wifi-watchdog.reboots
+
+STARTUP_DELAY=120	# let the system settle after boot / driver load
+CHECK_INTERVAL=20	# seconds between health checks
+SOFT_AFTER=3		# consecutive failures before soft recovery (~1 min)
+HARD_AFTER=6		# consecutive failures before reloading the driver (~2 min)
+SETTLE_TIME=60		# grace period after a driver reload
+HARD_BACKOFF_MIN=300	# minimum seconds between driver reloads, doubled ...
+HARD_BACKOFF_MAX=3600	# ... while the link stays down, up to this
+MAX_REBOOTS=3		# consecutive watchdog reboots without a working link
+
+[ -r /etc/wlan.conf ] && . /etc/wlan.conf
+
+log() {
+	/usr/bin/logger -t wifi-watchdog "$*"
+}
+
+uptime_secs() {
+	cut -d. -f1 /proc/uptime
+}
+
+watchdog_running() {
+	[ -r $PIDFILE ] || return 1
+	pid=`cat $PIDFILE`
+	[ -n "$pid" ] && grep -q wifi-watchdog /proc/$pid/cmdline 2>/dev/null
+}
+
+# Wired ethernet has link: the wireless link is not in use.
+wired_up() {
+	ip link show eth0 2>/dev/null | grep -q "state UP"
+}
+
+# The ifup mapping (logical interface) of eth1, as written by SqueezePlay.
+# Empty if eth1 is not configured up, e.g. during network setup.
+active_mapping() {
+	sed -n "s/^$IFACE=//p" /var/run/ifstate 2>/dev/null | head -n 1
+}
+
+# 'dhcp' or 'static' for a logical interface in /etc/network/interfaces.
+inet_method() {
+	awk -v n="$1" '$1 == "iface" && $2 == n { print $4; exit }' /etc/network/interfaces 2>/dev/null
+}
+
+udhcpc_running() {
+	[ -r $UDHCPC_PIDFILE ] && kill -0 `cat $UDHCPC_PIDFILE` 2>/dev/null
+}
+
+# Same options as ifup (see busybox_udhcpd_syslog.patch).
+start_udhcpc() {
+	udhcpc -R -a -p $UDHCPC_PIDFILE -b --syslog -i $IFACE -H `hostname` \
+		-s /etc/network/udhcpc_action >/dev/null 2>&1
+}
+
+gateway_reachable() {
+	arping -q -I $IFACE -c 3 -w 6 "$1" >/dev/null 2>&1 && return 0
+	# Fall back to ICMP in case the access point filters ARP probes.
+	ping -c 2 -W 3 "$1" >/dev/null 2>&1
+}
+
+# Returns 0 if the link passes traffic, otherwise sets REASON and returns 1.
+check_health() {
+	if ! pidof wpa_supplicant >/dev/null; then
+		REASON="wpa_supplicant not running"
+		return 1
+	fi
+
+	state=`wpa_cli -i $IFACE status 2>/dev/null | sed -n 's/^wpa_state=//p'`
+	if [ "$state" != "COMPLETED" ]; then
+		REASON="not associated (wpa_state=${state:-no reply})"
+		return 1
+	fi
+
+	ip=`ip addr show dev $IFACE 2>/dev/null | sed -n 's/^ *inet \([0-9.]*\).*/\1/p' | head -n 1`
+	case "$ip" in
+	"")
+		REASON="no IP address"
+		return 1
+		;;
+	169.254.*)
+		REASON="no DHCP lease (link-local address $ip)"
+		return 1
+		;;
+	esac
+
+	gw=`ip route 2>/dev/null | sed -n "s/^default via \([0-9.]*\) dev $IFACE.*/\1/p" | head -n 1`
+	if [ -z "$gw" ]; then
+		REASON="no default gateway"
+		return 1
+	fi
+
+	if ! gateway_reachable "$gw"; then
+		REASON="gateway $gw not answering"
+		return 1
+	fi
+
+	return 0
+}
+
+soft_recover() {
+	log "soft recovery: reassociating and renewing DHCP lease ($REASON)"
+
+	# wpa_cli in action mode kicks udhcpc after every reconnect
+	pidof wpa_cli >/dev/null || /usr/sbin/wpa_cli -B -a/etc/network/wpa_action
+
+	wpa_cli -i $IFACE reassociate >/dev/null 2>&1
+
+	if [ "`inet_method "$MAPPING"`" != "static" ]; then
+		if udhcpc_running; then
+			kill -USR1 `cat $UDHCPC_PIDFILE`
+		else
+			log "udhcpc not running, restarting it"
+			start_udhcpc
+		fi
+	fi
+}
+
+# Run a command, giving up after $1 seconds (an unload can hang on a
+# wedged chip). Returns the command's exit status, or 124 on timeout.
+run_timeout() {
+	secs=$1
+	shift
+	"$@" >/dev/null 2>&1 &
+	child=$!
+	while kill -0 $child 2>/dev/null; do
+		if [ $secs -le 0 ]; then
+			kill $child 2>/dev/null
+			return 124
+		fi
+		sleep 1
+		secs=$((secs - 1))
+	done
+	wait $child
+}
+
+# Returns 1 if the driver could not be reloaded.
+hard_recover() {
+	log "hard recovery: reloading wifi driver ($REASON)"
+
+	# Tell the wlan script not to stop this watchdog
+	export WIFI_WATCHDOG=1
+
+	if ! run_timeout 90 /etc/init.d/wlan stop; then
+		log "wifi driver did not unload"
+		return 1
+	fi
+	if ! run_timeout 120 /etc/init.d/wlan start; then
+		log "wifi driver failed to load, retrying"
+		run_timeout 90 /etc/init.d/wlan stop
+		if ! run_timeout 120 /etc/init.d/wlan start; then
+			log "wifi driver failed to load"
+			return 1
+		fi
+	fi
+
+	# Reloading the driver recreates eth1 without any IP configuration,
+	# and 'wlan stop' killed udhcpc.
+	if [ "`inet_method "$MAPPING"`" = "static" ]; then
+		ifdown -f "$IFACE=$MAPPING" >/dev/null 2>&1
+		ifup "$IFACE=$MAPPING" >/dev/null 2>&1
+	else
+		udhcpc_running && kill -TERM `cat $UDHCPC_PIDFILE`
+		start_udhcpc
+	fi
+	wpa_cli -i $IFACE reassociate >/dev/null 2>&1
+
+	return 0
+}
+
+last_resort_reboot() {
+	if [ "$watchdog_reboot" = "off" ]; then
+		log "wifi driver is wedged, not rebooting (watchdog_reboot=off)"
+		return
+	fi
+
+	count=`cat $REBOOT_COUNT_FILE 2>/dev/null`
+	case "$count" in
+	''|*[!0-9]*) count=0 ;;
+	esac
+	if [ $count -ge $MAX_REBOOTS ]; then
+		log "wifi driver is wedged, giving up after $count reboots"
+		return
+	fi
+
+	echo $((count + 1)) > $REBOOT_COUNT_FILE
+	sync
+	log "wifi driver is wedged, rebooting (attempt $((count + 1)) of $MAX_REBOOTS)"
+	sleep 2
+	/sbin/reboot
+}
+
+watch_loop() {
+	sleep $STARTUP_DELAY
+
+	failures=0
+	hard_backoff=$HARD_BACKOFF_MIN
+	next_hard=0
+
+	while true; do
+		sleep $CHECK_INTERVAL
+
+		MAPPING=`active_mapping`
+		if wired_up || [ -z "$MAPPING" ]; then
+			failures=0
+			continue
+		fi
+
+		if check_health; then
+			[ $failures -ge $SOFT_AFTER ] && log "wifi link recovered"
+			failures=0
+			hard_backoff=$HARD_BACKOFF_MIN
+			next_hard=0
+			[ -e $REBOOT_COUNT_FILE ] && rm -f $REBOOT_COUNT_FILE
+			continue
+		fi
+
+		failures=$((failures + 1))
+		[ $failures -eq 1 ] && log "wifi link check failed: $REASON"
+
+		now=`uptime_secs`
+		if [ $failures -ge $HARD_AFTER ] && [ $now -ge $next_hard ]; then
+			hard_recover || last_resort_reboot
+
+			next_hard=$((now + hard_backoff))
+			hard_backoff=$((hard_backoff * 2))
+			[ $hard_backoff -gt $HARD_BACKOFF_MAX ] && hard_backoff=$HARD_BACKOFF_MAX
+
+			# Stay escalated: the next driver reload waits for the backoff
+			failures=$SOFT_AFTER
+			sleep $SETTLE_TIME
+		elif [ $failures -eq $SOFT_AFTER ]; then
+			soft_recover
+		fi
+	done
+}
+
+case "$1" in
+stop)
+	watchdog_running && kill `cat $PIDFILE` 2>/dev/null
+	rm -f $PIDFILE
+	exit 0
+	;;
+esac
+
+[ "$watchdog" = "off" ] && exit 0
+watchdog_running && exit 0
+
+trap "" HUP INT QUIT TSTP
+watch_loop </dev/null >/dev/null 2>&1 &
+echo $! > $PIDFILE
+log "started"
+exit 0

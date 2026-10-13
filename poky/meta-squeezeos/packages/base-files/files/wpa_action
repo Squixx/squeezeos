@@ -7,10 +7,11 @@ CMD=$2
 
 if [ "$CMD" = "CONNECTED" ]; then
 	# Kick DHCP client to do a renewal
-	kill -usr1 `cat /var/run/udhcpc.$IFNAME.pid`
+	if [ -r /var/run/udhcpc.$IFNAME.pid ]; then
+		kill -usr1 `cat /var/run/udhcpc.$IFNAME.pid`
+	fi
 fi
 
-if [ "$CMD" = "DISCONNECTED" ]; then 
-	# TODO any actions still needed?
-fi
+# Nothing to do on DISCONNECTED: wpa_supplicant reconnects by itself (and on
+# the Radio, /usr/sbin/wifi-watchdog recovers links that do not come back).
 
