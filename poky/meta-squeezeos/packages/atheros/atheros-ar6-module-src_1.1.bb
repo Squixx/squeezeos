@@ -3,7 +3,7 @@ SECTION = "base"
 LICENSE = "binary only"
 
 PV = "1.1"
-PR = "r3"
+PR = "r4"
 DV = "83"
 
 PROVIDES = "atheros-ar6-module"
