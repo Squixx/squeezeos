@@ -51,6 +51,10 @@ case "$1" in
 		${WORKAREA}/wmiconfig --wmode gonly
 	fi
 
+	if [ "${arpwatch}" == "on" ]; then
+		${WORKAREA}/watch-arp.sh
+	fi
+
 	if [ "${maxperf}" == "on" ]; then
 		${WORKAREA}/wmiconfig -eth1 --power maxperf
 	fi
@@ -67,24 +71,11 @@ case "$1" in
 	/usr/bin/logger "Started wpa_supplicant"
 	sleep 1;
 
-	# Watch the link and recover it if the driver/firmware stops passing
-	# traffic. The older ARP watch is only used if the watchdog is disabled.
-	if [ "${watchdog}" != "off" ]; then
-		/usr/sbin/wifi-watchdog
-	elif [ "${arpwatch}" == "on" ]; then
-		${WORKAREA}/watch-arp.sh
-	fi
-
 	/usr/bin/logger -s "wlan started"
 	;;
 
     stop)
         /usr/bin/logger -s "wlan: stopping"
-
-	# Stop the watchdog, unless it is the one reloading the driver
-	if [ -z "${WIFI_WATCHDOG}" ]; then
-		/usr/sbin/wifi-watchdog stop
-	fi
 
 	# Stop wpa supplicant
 	killall wpa_cli
