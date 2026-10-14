@@ -13,6 +13,7 @@ while true; do
 # at startup, wait until system is settled
  sleep 300
 
+ GATEWAY_FAILS=0
  while true; do
 #wake up every 5 seconds to check arp table
   sleep 5
@@ -23,10 +24,20 @@ while true; do
     ARP_TABLE_COUNT=`cat /proc/net/arp | wc -l`
     echo -n . 
 
+#a wedged driver often keeps stale ARP entries, so also check that the
+#default gateway still answers ARP; restart after 3 failed checks in a row
+    GATEWAY=`ip route | sed -n 's/^default via \([0-9.]*\) dev eth1.*/\1/p'`
+    if [ -n "$GATEWAY" ] && arping -q -I eth1 -c 2 -w 4 $GATEWAY >/dev/null 2>&1; then
+      GATEWAY_FAILS=0
+    else
+      GATEWAY_FAILS=$((GATEWAY_FAILS + 1))
+    fi
+
 #ARP_TABLE_COUNT includes 1 line of header, ignore that
-    if [ $ARP_TABLE_COUNT -le 1 ]; then      
+    if [ $ARP_TABLE_COUNT -le 1 ] || [ $GATEWAY_FAILS -ge 3 ]; then      
 	echo "restarting wifi"
-	logger "*** restarting wifi, ARP_TABLE_COUNT = $ARP_TABLE_COUNT"
+	logger "*** restarting wifi, ARP_TABLE_COUNT = $ARP_TABLE_COUNT, GATEWAY_FAILS = $GATEWAY_FAILS"
+	GATEWAY_FAILS=0
 
 	# restart wifi driver
 	/etc/init.d/wlan stop && /etc/init.d/wlan start
